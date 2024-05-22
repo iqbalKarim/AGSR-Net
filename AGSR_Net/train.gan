@@ -1,0 +1,139 @@
+import torch
+import torch.nn as nn
+from torch.optim.lr_scheduler import StepLR
+import numpy as np
+import matplotlib.pyplot as plt
+from .preprocessing import *
+from .model import *
+import torch.optim as optim
+from tqdm import tqdm
+from .my_config import device
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        m.weight.data.normal_(0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        m.weight.data.normal_(1.0, 0.02)
+        m.bias.data.fill_(0)
+
+def train(model, subjects_adj, subjects_labels, test_lr, test_hr, args):
+    bce_loss = nn.BCELoss()
+    criterion = nn.MSELoss()
+    netD = Discriminator(args).to(device)
+    netD.apply(weights_init)
+
+    optimizerG = torch.optim.Adam(model.parameters(), lr=0.0001, betas=(0.5, 0.999))
+    optimizerD = torch.optim.Adam(netD.parameters(), lr=0.0001, betas=(0.5, 0.999))
+    # Learning rate schedulers
+    schedulerG = StepLR(optimizerG, step_size=30, gamma=0.5)
+    schedulerD = StepLR(optimizerD, step_size=30, gamma=0.5)
+    with tqdm(range(args.epochs), desc='Training') as tepoch:
+        for epoch in tepoch:
+            with torch.autograd.set_detect_anomaly(True):
+                epoch_g_loss = []
+                epoch_d_loss = []
+                epoch_error = []
+                epoch_mse_loss = []
+                epoch_test_error = []
+                epoch_d_real = []
+                epoch_d_fake = []
+                epoch_g_fake = []
+
+                model.train()
+                for lr, hr in zip(subjects_adj, subjects_labels):
+                    optimizerD.zero_grad()
+                    optimizerG.zero_grad()
+                    
+                    hr = add_noise_to_adjacency_matrix(hr)
+                    hr = pad_HR_adj(hr, args.padding)
+                    lr = torch.from_numpy(lr).type(torch.FloatTensor).to(device)
+                    padded_hr = torch.from_numpy(hr).type(torch.FloatTensor).to(device)
+
+                    eig_val_hr, U_hr = torch.linalg.eigh(padded_hr, UPLO='U')
+
+                    model_outputs, net_outs, start_gcn_outs, layer_outs = model(
+                        lr, args.lr_dim, args.hr_dim)
+
+                    error = criterion(model_outputs, padded_hr)
+                    mse_loss = args.lmbda * criterion(net_outs, start_gcn_outs) + criterion(
+                        model.layer.weights, U_hr) + 0.7 * error
+                    
+                    real_data = padded_hr
+                    fake_data = model_outputs
+
+                    d_real = netD(real_data)
+                    d_fake = netD(fake_data.detach())
+
+                    # label smoothing
+                    soft_real_labels = torch.FloatTensor(args.hr_dim, 1).uniform_(0.9, 1.0).to(device)
+                    soft_fake_labels = torch.FloatTensor(args.hr_dim, 1).uniform_(0, 0.1).to(device)
+                    hard_real_labels = torch.ones(args.hr_dim, 1).to(device)
+
+                    dc_loss_real = 0.1 * bce_loss(d_real, soft_real_labels)
+                    dc_loss_real.backward()
+                    dc_loss_fake = 0.1 * bce_loss(d_fake, soft_fake_labels)
+                    dc_loss_fake.backward()
+                    dc_loss = dc_loss_real + dc_loss_fake
+                    optimizerD.step()
+
+                    g_fake = netD(fake_data)
+
+                    generator_loss = 0.1 * bce_loss(g_fake, hard_real_labels) + mse_loss
+                    generator_loss.backward()
+                    optimizerG.step()
+
+                    epoch_d_loss.append(dc_loss.item())
+                    epoch_g_loss.append(generator_loss.item())
+                    epoch_mse_loss.append(mse_loss.item())
+                    epoch_error.append(error.item())
+                    epoch_d_real.append(d_real.mean().item())
+                    epoch_d_fake.append(d_fake.mean().item())
+                    epoch_g_fake.append(g_fake.mean().item())
+
+            # Update learning rates
+            schedulerG.step()
+            schedulerD.step()
+
+            model.eval()
+            with torch.no_grad():
+                for lr, hr in zip(test_lr, test_hr):
+                    hr = pad_HR_adj(hr, args.padding)
+                    lr = torch.from_numpy(lr).type(torch.FloatTensor).to(device)
+                    padded_hr = torch.from_numpy(hr).type(torch.FloatTensor).to(device)
+
+                    eig_val_hr, U_hr = torch.linalg.eigh(padded_hr, UPLO='U')
+                    model_outputs, net_outs, start_gcn_outs, layer_outs = model(
+                        lr, args.lr_dim, args.hr_dim)
+                    recon_loss = criterion(model_outputs, padded_hr)
+                    mse_loss = args.lmbda * criterion(net_outs, start_gcn_outs) + criterion(
+                        model.layer.weights, U_hr) + recon_loss
+                    
+                    epoch_test_error.append(recon_loss.item())
+
+            tepoch.set_description(f"Epoch {epoch}")
+            tepoch.set_postfix(D_G_z=f"{np.mean(epoch_d_fake):.3f}/{np.mean(epoch_g_fake):.3f}", 
+                               D_x=np.mean(epoch_d_real),
+                               Loss_D=np.mean(epoch_d_loss), 
+                               Loss_G=np.mean(epoch_g_loss),
+                               epoch_mse_loss=np.mean(epoch_mse_loss),
+                               mse_error=f'{np.mean(epoch_error) * 100:.3f}%',
+                               mse_test_error=f'{np.mean(epoch_test_error) * 100:.3f}%')
+            print()
+
+
+def test(model, test_adj, args):
+
+    preds_list = []
+
+    for lr in test_adj:
+        all_zeros_lr = not np.any(lr)
+        if all_zeros_lr == False :
+            lr = torch.from_numpy(lr).type(torch.FloatTensor).to(device)
+            preds, a, b, c = model(lr, args.lr_dim, args.hr_dim)
+            preds = unpad(preds, args.padding).detach().cpu().numpy()
+            preds_list.append(preds)
+
+    return np.stack(preds_list)
+            
